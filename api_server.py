@@ -1,9 +1,9 @@
 """
-Production API Server - FIXED VERSION
-Properly handles script keys, HWID registration, and blacklisting
+Simple API Server - Personal Keys Only
+Each user gets their own unique key tied to their Discord ID
 """
 
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 import sqlite3
 import hashlib
@@ -34,13 +34,11 @@ def print_config():
     print("=" * 50)
     print(f"Database: {Config.DATABASE_PATH}")
     print(f"Port: {Config.PORT}")
-    print(f"Host: {Config.HOST}")
     print(f"Webhook: {'✅ Configured' if Config.DISCORD_WEBHOOK_URL else '❌ Not set'}")
-    print(f"Debug: {Config.DEBUG}")
     print("=" * 50)
 
 # =============================================
-# DATABASE FUNCTIONS
+# DATABASE
 # =============================================
 def init_database():
     conn = sqlite3.connect(Config.DATABASE_PATH)
@@ -51,49 +49,22 @@ def init_database():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             discord_id TEXT UNIQUE NOT NULL,
             username TEXT NOT NULL,
+            personal_key TEXT UNIQUE NOT NULL,
             hwid TEXT,
-            license_key TEXT UNIQUE,
             is_active INTEGER DEFAULT 1,
             expiry_date TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            last_reset TEXT
-        )
-    """)
-    
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS keys (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            key_code TEXT UNIQUE NOT NULL,
-            duration_days INTEGER NOT NULL,
-            is_redeemed INTEGER DEFAULT 0,
-            redeemed_by TEXT,
-            redeemed_at TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS scripts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            description TEXT,
-            script_key TEXT UNIQUE NOT NULL,
-            script_url TEXT,
-            script_content TEXT,
-            version TEXT DEFAULT '1.0.0',
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            last_hwid_reset TEXT
         )
     """)
     
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS blacklist (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            discord_id TEXT,
             hwid TEXT UNIQUE NOT NULL,
             reason TEXT NOT NULL,
             blacklisted_by TEXT NOT NULL,
-            discord_id TEXT,
-            roblox_username TEXT,
-            roblox_userid TEXT,
             blacklisted_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -109,26 +80,12 @@ def init_database():
         )
     """)
     
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS hwid_registry (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            discord_id TEXT NOT NULL,
-            hwid TEXT NOT NULL,
-            registered_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            last_seen TEXT DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(discord_id, hwid)
-        )
-    """)
-    
     conn.commit()
     conn.close()
     print("✅ Database initialized")
 
 def get_db():
     return sqlite3.connect(Config.DATABASE_PATH)
-
-def hash_hwid(hwid):
-    return hashlib.sha256(hwid.encode()).hexdigest()
 
 def log_request(f):
     @wraps(f)
@@ -157,18 +114,15 @@ def log_activity(discord_id=None, hwid=None, action="", details=""):
 @app.route('/', methods=['GET'])
 def index():
     return jsonify({
-        'service': 'Bedwars VisualScripts API',
+        'service': 'Bedwars ESP API',
         'status': 'online',
-        'version': '2.0.0',
+        'version': '3.0.0 - Simple Edition',
         'endpoints': {
             'health': 'GET /health',
             'verify_key': 'POST /verify-key',
-            'check_blacklist': 'POST /check-blacklist',
-            'register_hwid': 'POST /register-hwid',
-            'tamper_alert': 'POST /tamper-alert',
             'loader': 'GET /v3/files/loaders/esp.lua',
-            'admin_stats': 'GET /admin/stats',
-            'admin_hwidlist': 'GET /admin/hwid-list'
+            'esp_script': 'GET /v3/files/scripts/esp-main.lua',
+            'stats': 'GET /admin/stats'
         }
     })
 
@@ -177,257 +131,122 @@ def index():
 def health_check():
     return jsonify({
         'status': 'healthy',
-        'timestamp': datetime.now().isoformat(),
-        'database': 'connected',
-        'webhook': 'configured' if Config.DISCORD_WEBHOOK_URL else 'not_configured'
+        'timestamp': datetime.now().isoformat()
     })
 
 @app.route('/verify-key', methods=['POST'])
 @log_request
 def verify_key():
-    """Verify if a script key is valid"""
+    """Verify personal key and check blacklist"""
     try:
         data = request.get_json()
         
         if not data or 'script_key' not in data:
             return jsonify({'error': 'script_key required'}), 400
         
-        script_key = data['script_key']
+        personal_key = data['script_key']
         hwid = data.get('hwid')
         
         conn = get_db()
         cursor = conn.cursor()
         
-        # Check if script key exists
+        # Find user by their personal key
         cursor.execute(
-            "SELECT name, version FROM scripts WHERE script_key = ?",
-            (script_key,)
+            "SELECT discord_id, username, is_active, expiry_date, hwid FROM users WHERE personal_key = ?",
+            (personal_key,)
         )
-        script = cursor.fetchone()
+        user = cursor.fetchone()
         
-        if not script:
+        if not user:
             conn.close()
-            log_activity(hwid=hwid, action="INVALID_KEY", details=f"Key: {script_key[:16]}...")
-            return jsonify({'valid': False, 'error': 'Invalid script key'}), 403
+            log_activity(hwid=hwid, action="INVALID_KEY", details=f"Key: {personal_key[:16]}...")
+            return jsonify({'valid': False, 'error': 'Invalid personal key'}), 403
         
-        # If HWID provided, check blacklist
+        discord_id, username, is_active, expiry_date, registered_hwid = user
+        
+        # Check if active
+        if not is_active:
+            conn.close()
+            log_activity(discord_id=discord_id, hwid=hwid, action="INACTIVE_USER", details="User is deactivated")
+            return jsonify({'valid': False, 'error': 'Access revoked'}), 403
+        
+        # Check if expired
+        if expiry_date and datetime.fromisoformat(expiry_date) < datetime.now():
+            conn.close()
+            log_activity(discord_id=discord_id, hwid=hwid, action="EXPIRED_USER", details="Subscription expired")
+            return jsonify({'valid': False, 'error': 'Subscription expired'}), 403
+        
+        # Check if HWID is blacklisted
         if hwid:
-            cursor.execute(
-                "SELECT reason FROM blacklist WHERE hwid = ?",
-                (hwid,)
-            )
+            cursor.execute("SELECT reason FROM blacklist WHERE hwid = ?", (hwid,))
             blacklist_result = cursor.fetchone()
             
             if blacklist_result:
                 conn.close()
-                log_activity(hwid=hwid, action="BLACKLIST_CHECK", details="HWID is blacklisted")
+                log_activity(discord_id=discord_id, hwid=hwid, action="BLACKLIST_ATTEMPT", details="HWID is blacklisted")
                 return jsonify({
                     'valid': False,
                     'blacklisted': True,
                     'reason': blacklist_result[0]
                 }), 403
+            
+            # Register or update HWID
+            if not registered_hwid:
+                cursor.execute(
+                    "UPDATE users SET hwid = ? WHERE discord_id = ?",
+                    (hwid, discord_id)
+                )
+                conn.commit()
+                log_activity(discord_id=discord_id, hwid=hwid, action="HWID_REGISTERED", details="First time execution")
+            elif registered_hwid != hwid:
+                # HWID changed - potential HWID reset or new device
+                log_activity(discord_id=discord_id, hwid=hwid, action="HWID_CHANGED", details=f"Old: {registered_hwid[:16]}...")
+                # You can choose to block this or allow it
+                # For now, we'll update it
+                cursor.execute(
+                    "UPDATE users SET hwid = ? WHERE discord_id = ?",
+                    (hwid, discord_id)
+                )
+                conn.commit()
         
         conn.close()
         
-        log_activity(hwid=hwid, action="KEY_VERIFIED", details=f"Script: {script[0]}")
+        log_activity(discord_id=discord_id, hwid=hwid, action="KEY_VERIFIED", details=f"User: {username}")
         
         return jsonify({
             'valid': True,
-            'script_name': script[0],
-            'version': script[1]
+            'script_name': 'Bedwars ESP',
+            'version': '1.0.0',
+            'username': username
         })
         
     except Exception as e:
         print(f"❌ Error verifying key: {e}")
         return jsonify({'error': str(e)}), 500
 
-@app.route('/check-blacklist', methods=['POST'])
-@log_request
-def check_blacklist():
-    """Check if HWID is blacklisted"""
-    try:
-        data = request.get_json()
-        
-        if not data or 'hwid' not in data:
-            return jsonify({'error': 'HWID required'}), 400
-        
-        hwid = data['hwid']
-        script_key = data.get('script_key')
-        
-        # Verify script key first
-        if script_key:
-            conn = get_db()
-            cursor = conn.cursor()
-            cursor.execute("SELECT id FROM scripts WHERE script_key = ?", (script_key,))
-            if not cursor.fetchone():
-                conn.close()
-                return jsonify({'error': 'Invalid script key'}), 403
-            conn.close()
-        
-        conn = get_db()
-        cursor = conn.cursor()
-        
-        cursor.execute(
-            "SELECT reason, blacklisted_at, blacklisted_by FROM blacklist WHERE hwid = ?",
-            (hwid,)
-        )
-        result = cursor.fetchone()
-        
-        conn.close()
-        
-        if result:
-            log_activity(hwid=hwid, action="BLACKLIST_ATTEMPT", details="Blocked")
-            return jsonify({
-                'blacklisted': True,
-                'reason': result[0],
-                'blacklisted_at': result[1],
-                'blacklisted_by': result[2]
-            })
-        
-        return jsonify({'blacklisted': False})
-        
-    except Exception as e:
-        print(f"❌ Error checking blacklist: {e}")
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/register-hwid', methods=['POST'])
-@log_request
-def register_hwid():
-    """Register a user's HWID when they execute the script"""
-    try:
-        data = request.get_json()
-        
-        if not data or 'hwid' not in data:
-            return jsonify({'error': 'HWID required'}), 400
-        
-        hwid = data['hwid']
-        discord_id = data.get('discord_id')
-        script_key = data.get('script_key')
-        
-        # Verify script key
-        if script_key:
-            conn = get_db()
-            cursor = conn.cursor()
-            cursor.execute("SELECT id FROM scripts WHERE script_key = ?", (script_key,))
-            if not cursor.fetchone():
-                conn.close()
-                return jsonify({'error': 'Invalid script key'}), 403
-            conn.close()
-        
-        # Check if blacklisted first
-        conn = get_db()
-        cursor = conn.cursor()
-        cursor.execute("SELECT reason FROM blacklist WHERE hwid = ?", (hwid,))
-        blacklist_result = cursor.fetchone()
-        
-        if blacklist_result:
-            conn.close()
-            log_activity(discord_id=discord_id, hwid=hwid, action="BLACKLIST_REGISTER_ATTEMPT", details="Blocked")
-            return jsonify({
-                'success': False,
-                'blacklisted': True,
-                'reason': blacklist_result[0]
-            }), 403
-        
-        # Register or update HWID
-        if discord_id:
-            try:
-                cursor.execute(
-                    "INSERT INTO hwid_registry (discord_id, hwid) VALUES (?, ?) "
-                    "ON CONFLICT(discord_id, hwid) DO UPDATE SET last_seen = CURRENT_TIMESTAMP",
-                    (discord_id, hwid)
-                )
-                
-                # Update user table
-                cursor.execute(
-                    "UPDATE users SET hwid = ? WHERE discord_id = ?",
-                    (hwid, discord_id)
-                )
-                
-                conn.commit()
-                
-                log_activity(discord_id=discord_id, hwid=hwid, action="HWID_REGISTERED", details="Success")
-                
-            except sqlite3.IntegrityError:
-                pass
-        else:
-            # Log anonymous HWID
-            log_activity(hwid=hwid, action="ANONYMOUS_HWID", details="No Discord ID")
-        
-        conn.close()
-        
-        return jsonify({'success': True, 'hwid_registered': True})
-        
-    except Exception as e:
-        print(f"❌ Error registering HWID: {e}")
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/tamper-alert', methods=['POST'])
-@log_request
-def tamper_alert():
-    """Receive and forward tamper alerts"""
-    try:
-        data = request.get_json()
-        
-        if not data or 'embeds' not in data:
-            return jsonify({'error': 'Invalid data'}), 400
-        
-        print(f"🚨 Tamper alert received")
-        
-        # Forward to Discord webhook
-        if Config.DISCORD_WEBHOOK_URL:
-            try:
-                import requests
-                
-                response = requests.post(
-                    Config.DISCORD_WEBHOOK_URL,
-                    json=data,
-                    headers={'Content-Type': 'application/json'},
-                    timeout=10
-                )
-                
-                if response.status_code == 204:
-                    print("✅ Alert forwarded to Discord")
-                else:
-                    print(f"⚠️ Discord webhook returned: {response.status_code}")
-                    
-            except Exception as e:
-                print(f"❌ Error forwarding to Discord: {e}")
-        else:
-            print("⚠️ No webhook URL configured, alert not forwarded")
-        
-        return jsonify({'success': True})
-        
-    except Exception as e:
-        print(f"❌ Error handling tamper alert: {e}")
-        return jsonify({'error': str(e)}), 500
-
 @app.route('/v3/files/loaders/esp.lua', methods=['GET'])
 @log_request
 def get_esp_loader():
-    """
-    Return the ESP loader script that validates the script key
-    Users execute: scriptkey = "KEY"; loadstring(game:HttpGet("THIS_URL"))()
-    """
+    """Return the ESP loader script"""
     try:
-        esp_template = '''-- Bedwars ESP Loader
--- API: ''' + request.host_url + '''
+        esp_template = '''-- Bedwars ESP Loader - Simple Edition
+-- Each user has their own personal key
 
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local LocalPlayer = Players.LocalPlayer
 
--- Check if scriptkey variable exists in global scope
+-- Check if scriptkey variable exists
 if not scriptkey then
     LocalPlayer:Kick("❌ Missing script key!\\n\\nUsage:\\nscriptkey = \\"YOUR_KEY\\";\\nloadstring(game:HttpGet(...))()")
     return
 end
 
-local SCRIPT_KEY = scriptkey
+local PERSONAL_KEY = scriptkey
 local API_URL = "''' + request.host_url.rstrip('/') + '''"
 local HWID = game:GetService("RbxAnalyticsService"):GetClientId()
 
-print("🔐 Verifying script key: " .. SCRIPT_KEY:sub(1, 8) .. "...")
+print("🔐 Verifying your personal key...")
 
 -- Verify key with API
 local function verifyKey()
@@ -437,7 +256,7 @@ local function verifyKey()
             Method = "POST",
             Headers = {["Content-Type"] = "application/json"},
             Body = HttpService:JSONEncode({
-                script_key = SCRIPT_KEY,
+                script_key = PERSONAL_KEY,
                 hwid = HWID
             })
         })
@@ -461,28 +280,11 @@ local function verifyKey()
     end
     
     if not result.valid then
-        LocalPlayer:Kick("❌ Invalid script key!\\n\\nGet a valid key from the Discord server.")
+        LocalPlayer:Kick("❌ " .. (result.error or "Invalid key") .. "\\n\\nGet your key from Discord using /getscript")
         return false
     end
     
     return true, result
-end
-
--- Register HWID
-local function registerHWID()
-    spawn(function()
-        pcall(function()
-            request({
-                Url = API_URL .. "/register-hwid",
-                Method = "POST",
-                Headers = {["Content-Type"] = "application/json"},
-                Body = HttpService:JSONEncode({
-                    hwid = HWID,
-                    script_key = SCRIPT_KEY
-                })
-            })
-        end)
-    end)
 end
 
 -- Verify and load
@@ -492,11 +294,8 @@ if not verified then
     return
 end
 
-print("✅ Key verified! Loading " .. data.script_name .. " v" .. data.version)
-print("📍 HWID: " .. HWID:sub(1, 16) .. "...")
-
--- Register HWID in background
-registerHWID()
+print("✅ Authenticated as: " .. data.username)
+print("✅ Loading " .. data.script_name .. " v" .. data.version)
 
 -- Load the actual ESP script
 local success, err = pcall(function()
@@ -518,178 +317,117 @@ end
 @app.route('/v3/files/scripts/esp-main.lua', methods=['GET'])
 @log_request
 def get_esp_main():
-    """Return the main ESP script (after verification)"""
+    """Return the main ESP script"""
     try:
-        # Load the actual ESP script from file or database
         esp_main_path = os.path.join(os.path.dirname(__file__), 'esp-main.lua')
         
         if os.path.exists(esp_main_path):
             with open(esp_main_path, 'r') as f:
                 return f.read(), 200, {'Content-Type': 'text/plain'}
         else:
-            # Return a basic ESP script
-            return '''
--- Bedwars ESP Main Script
+            return '''-- Bedwars ESP Main Script
 print("✅ ESP Loaded!")
 print("📍 HWID: " .. game:GetService("RbxAnalyticsService"):GetClientId():sub(1, 16) .. "...")
+print("🎮 Press INSERT to toggle ESP")
 
--- Your ESP code here
-local Players = game:GetService("Players")
-local LocalPlayer = Players.LocalPlayer
-
-print("🎮 Press INSERT to toggle ESP GUI")
-
--- ESP functionality would go here
+-- Your full ESP code goes here
 ''', 200, {'Content-Type': 'text/plain'}
         
     except Exception as e:
         print(f"❌ Error serving ESP main: {e}")
         return f"-- Error: {str(e)}", 500, {'Content-Type': 'text/plain'}
 
-# =============================================
-# ADMIN ENDPOINTS
-# =============================================
-@app.route('/admin/add-key', methods=['POST'])
+@app.route('/tamper-alert', methods=['POST'])
 @log_request
-def admin_add_key():
-    """Add a license key (called from Discord bot)"""
+def tamper_alert():
+    """Receive tamper alerts"""
     try:
         data = request.get_json()
         
-        if not data or 'key_code' not in data or 'duration_days' not in data:
-            return jsonify({'error': 'key_code and duration_days required'}), 400
-        
-        key_code = data['key_code']
-        duration_days = data['duration_days']
-        
-        conn = get_db()
-        cursor = conn.cursor()
-        
-        try:
-            cursor.execute(
-                "INSERT INTO keys (key_code, duration_days) VALUES (?, ?)",
-                (key_code, duration_days)
-            )
-            conn.commit()
-            
-            log_activity(action="KEY_ADDED", details=f"{key_code} - {duration_days}d")
-            
-            return jsonify({'success': True})
-            
-        except sqlite3.IntegrityError:
-            return jsonify({'error': 'Key already exists'}), 409
-        finally:
-            conn.close()
-        
-    except Exception as e:
-        print(f"❌ Error adding key: {e}")
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/admin/delete-key', methods=['POST'])
-@log_request
-def admin_delete_key():
-    """Delete a license key"""
-    try:
-        data = request.get_json()
-        
-        if not data or 'key_code' not in data:
-            return jsonify({'error': 'key_code required'}), 400
-        
-        key_code = data['key_code']
-        
-        conn = get_db()
-        cursor = conn.cursor()
-        
-        cursor.execute("DELETE FROM keys WHERE key_code = ?", (key_code,))
-        conn.commit()
-        conn.close()
-        
-        log_activity(action="KEY_DELETED", details=key_code)
+        if Config.DISCORD_WEBHOOK_URL:
+            try:
+                import requests
+                requests.post(
+                    Config.DISCORD_WEBHOOK_URL,
+                    json=data,
+                    headers={'Content-Type': 'application/json'},
+                    timeout=10
+                )
+                print("✅ Alert forwarded to Discord")
+            except Exception as e:
+                print(f"❌ Error forwarding alert: {e}")
         
         return jsonify({'success': True})
         
     except Exception as e:
-        print(f"❌ Error deleting key: {e}")
+        print(f"❌ Error handling alert: {e}")
         return jsonify({'error': str(e)}), 500
 
-@app.route('/admin/add-script', methods=['POST'])
+# =============================================
+# ADMIN ENDPOINTS
+# =============================================
+@app.route('/admin/whitelist-user', methods=['POST'])
 @log_request
-def admin_add_script():
-    """Add a script (called from Discord bot)"""
+def admin_whitelist_user():
+    """Whitelist a user (called from Discord bot)"""
     try:
         data = request.get_json()
         
-        if not data or 'name' not in data or 'script_key' not in data:
-            return jsonify({'error': 'name and script_key required'}), 400
+        if not data or 'discord_id' not in data or 'personal_key' not in data:
+            return jsonify({'error': 'discord_id and personal_key required'}), 400
         
-        name = data['name']
-        script_key = data['script_key']
-        description = data.get('description', 'ESP Script')
+        discord_id = data['discord_id']
+        personal_key = data['personal_key']
+        username = data.get('username', 'Unknown')
         
         conn = get_db()
         cursor = conn.cursor()
         
         try:
             cursor.execute(
-                "INSERT INTO scripts (name, script_key, description) VALUES (?, ?, ?)",
-                (name, script_key, description)
+                "INSERT INTO users (discord_id, username, personal_key, is_active) VALUES (?, ?, ?, 1)",
+                (discord_id, username, personal_key)
             )
             conn.commit()
             
-            log_activity(action="SCRIPT_ADDED", details=f"{name} - {script_key}")
+            log_activity(discord_id=discord_id, action="USER_WHITELISTED", details=f"User: {username}")
             
             return jsonify({'success': True})
             
         except sqlite3.IntegrityError:
-            return jsonify({'error': 'Script already exists'}), 409
+            return jsonify({'error': 'User already exists'}), 409
         finally:
             conn.close()
         
     except Exception as e:
-        print(f"❌ Error adding script: {e}")
+        print(f"❌ Error whitelisting user: {e}")
         return jsonify({'error': str(e)}), 500
 
-@app.route('/admin/register-hwid', methods=['POST'])
+@app.route('/admin/remove-whitelist', methods=['POST'])
 @log_request
-def admin_register_hwid():
-    """Register HWID (called from Discord bot or script)"""
+def admin_remove_whitelist():
+    """Remove user from whitelist"""
     try:
         data = request.get_json()
         
-        if not data or 'discord_id' not in data or 'hwid' not in data:
-            return jsonify({'error': 'discord_id and hwid required'}), 400
+        if not data or 'discord_id' not in data:
+            return jsonify({'error': 'discord_id required'}), 400
         
         discord_id = data['discord_id']
-        hwid = data['hwid']
         
         conn = get_db()
         cursor = conn.cursor()
         
-        try:
-            cursor.execute(
-                "INSERT INTO hwid_registry (discord_id, hwid) VALUES (?, ?) "
-                "ON CONFLICT(discord_id, hwid) DO UPDATE SET last_seen = CURRENT_TIMESTAMP",
-                (discord_id, hwid)
-            )
-            
-            cursor.execute(
-                "UPDATE users SET hwid = ? WHERE discord_id = ?",
-                (hwid, discord_id)
-            )
-            
-            conn.commit()
-            
-            log_activity(discord_id=discord_id, hwid=hwid, action="HWID_REGISTERED", details="Via admin")
-            
-            return jsonify({'success': True})
-            
-        except Exception as e:
-            return jsonify({'error': str(e)}), 500
-        finally:
-            conn.close()
+        cursor.execute("UPDATE users SET is_active = 0 WHERE discord_id = ?", (discord_id,))
+        conn.commit()
+        conn.close()
+        
+        log_activity(discord_id=discord_id, action="USER_REMOVED", details="Removed from whitelist")
+        
+        return jsonify({'success': True})
         
     except Exception as e:
-        print(f"❌ Error registering HWID: {e}")
+        print(f"❌ Error removing user: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/admin/blacklist', methods=['POST'])
@@ -700,7 +438,7 @@ def admin_blacklist():
         data = request.get_json()
         
         if not data or 'hwid' not in data or 'reason' not in data:
-            return jsonify({'error': 'HWID and reason required'}), 400
+            return jsonify({'error': 'hwid and reason required'}), 400
         
         hwid = data['hwid']
         reason = data['reason']
@@ -712,15 +450,15 @@ def admin_blacklist():
         
         try:
             cursor.execute(
-                "INSERT INTO blacklist (hwid, reason, blacklisted_by, discord_id) VALUES (?, ?, ?, ?)",
-                (hwid, reason, blacklisted_by, discord_id)
+                "INSERT INTO blacklist (discord_id, hwid, reason, blacklisted_by) VALUES (?, ?, ?, ?)",
+                (discord_id, hwid, reason, blacklisted_by)
             )
             
             cursor.execute("UPDATE users SET is_active = 0 WHERE hwid = ?", (hwid,))
             
             conn.commit()
             
-            log_activity(discord_id=discord_id, hwid=hwid, action="BLACKLISTED", details=reason)
+            log_activity(discord_id=discord_id, hwid=hwid, action="HWID_BLACKLISTED", details=reason)
             
             print(f"🚫 HWID blacklisted: {hwid[:16]}... - Reason: {reason}")
             
@@ -752,14 +490,8 @@ def admin_stats():
         cursor.execute("SELECT COUNT(*) FROM blacklist")
         blacklisted = cursor.fetchone()[0]
         
-        cursor.execute("SELECT COUNT(*) FROM scripts")
-        total_scripts = cursor.fetchone()[0]
-        
-        cursor.execute("SELECT COUNT(*) FROM keys WHERE is_redeemed = 1")
-        redeemed_keys = cursor.fetchone()[0]
-        
-        cursor.execute("SELECT COUNT(DISTINCT hwid) FROM hwid_registry")
-        unique_hwids = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM users WHERE hwid IS NOT NULL")
+        with_hwid = cursor.fetchone()[0]
         
         conn.close()
         
@@ -767,9 +499,7 @@ def admin_stats():
             'total_users': total_users,
             'active_users': active_users,
             'blacklisted': blacklisted,
-            'total_scripts': total_scripts,
-            'redeemed_keys': redeemed_keys,
-            'unique_hwids': unique_hwids
+            'users_with_hwid': with_hwid
         })
         
     except Exception as e:
@@ -785,11 +515,10 @@ def admin_hwid_list():
         cursor = conn.cursor()
         
         cursor.execute("""
-            SELECT u.discord_id, u.username, u.hwid, h.last_seen
-            FROM users u
-            LEFT JOIN hwid_registry h ON u.discord_id = h.discord_id AND u.hwid = h.hwid
-            WHERE u.hwid IS NOT NULL
-            ORDER BY h.last_seen DESC
+            SELECT discord_id, username, hwid, created_at
+            FROM users
+            WHERE hwid IS NOT NULL
+            ORDER BY created_at DESC
         """)
         
         hwids = []
@@ -798,7 +527,7 @@ def admin_hwid_list():
                 'discord_id': row[0],
                 'username': row[1],
                 'hwid': row[2],
-                'last_seen': row[3]
+                'registered': row[3]
             })
         
         conn.close()
@@ -822,7 +551,7 @@ def internal_error(error):
 # =============================================
 if __name__ == '__main__':
     print("=" * 50)
-    print("Bedwars VisualScripts API Server v2.0")
+    print("Simple Bedwars ESP API v3.0")
     print("=" * 50)
     
     print_config()
