@@ -269,14 +269,15 @@ print("📍 HWID: " .. HWID:sub(1, 16) .. "...")
 -- Verify key with API
 local function verifyKey()
     local success, result = pcall(function()
-        -- Use game:HttpPost for Roblox
-        local response = game:HttpPost(
+        -- Use HttpService:PostAsync for Roblox
+        local response = HttpService:PostAsync(
             API_URL .. "/verify-key",
             HttpService:JSONEncode({
                 script_key = PERSONAL_KEY,
                 hwid = HWID
             }),
-            Enum.HttpContentType.ApplicationJson
+            Enum.HttpContentType.ApplicationJson,
+            false
         )
         return HttpService:JSONDecode(response)
     end)
