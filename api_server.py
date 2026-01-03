@@ -303,13 +303,16 @@ def get_script_info(key):
 @app.route('/raw/<key>', methods=['GET'])
 @log_request
 def get_raw_script(key):
-    """Get raw Lua script for loadstring"""
+    """
+    Get raw Lua script with auth key injected
+    This is what users will use: script_key = "KEY"; loadstring(game:HttpGet("url"))()
+    """
     try:
         conn = get_db()
         cursor = conn.cursor()
         
         cursor.execute(
-            "SELECT script_content, script_url FROM scripts WHERE script_key = ?",
+            "SELECT script_content, script_url, name FROM scripts WHERE script_key = ?",
             (key,)
         )
         result = cursor.fetchone()
@@ -318,13 +321,34 @@ def get_raw_script(key):
         if result:
             script_content = result[0]
             script_url = result[1]
+            script_name = result[2]
             
+            # If content is in database, inject the key and return
             if script_content:
+                # Replace placeholder with actual key
+                script_content = script_content.replace('SCRIPT_KEY = "PASTE-KEY-HERE"', f'SCRIPT_KEY = "{key}"')
+                script_content = script_content.replace('script_key = "PUT_YOUR_KEY_HERE"', f'script_key = "{key}"')
                 return script_content, 200, {'Content-Type': 'text/plain'}
+            
+            # If URL is provided, redirect
             elif script_url:
-                return jsonify({'message': 'Script hosted externally', 'url': script_url}), 200
+                return jsonify({
+                    'message': 'Script hosted externally',
+                    'url': script_url
+                }), 200
+            
+            # Default: Return ESP script with injected key
             else:
-                return "-- Script content not available", 404, {'Content-Type': 'text/plain'}
+                # Load ESP script template
+                esp_script_path = os.path.join(os.path.dirname(__file__), 'esp-script.lua')
+                if os.path.exists(esp_script_path):
+                    with open(esp_script_path, 'r') as f:
+                        esp_content = f.read()
+                    # Inject the key
+                    esp_content = esp_content.replace('SCRIPT_KEY = "PASTE-KEY-HERE"', f'SCRIPT_KEY = "{key}"')
+                    return esp_content, 200, {'Content-Type': 'text/plain'}
+                else:
+                    return f'-- ESP Script for {script_name}\n-- Key: {key}\nprint("✅ Script loaded!")', 200, {'Content-Type': 'text/plain'}
         
         return "-- Invalid script key", 404, {'Content-Type': 'text/plain'}
         
