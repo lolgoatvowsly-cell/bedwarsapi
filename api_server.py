@@ -90,8 +90,7 @@ def get_db():
 def log_request(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        if Config.DEBUG:
-            print(f"📡 {request.method} {request.path} from {request.remote_addr}")
+        print(f"📡 {request.method} {request.path} from {request.remote_addr}")
         return f(*args, **kwargs)
     return decorated_function
 
@@ -116,7 +115,7 @@ def index():
     return jsonify({
         'service': 'Bedwars ESP API',
         'status': 'online',
-        'version': '3.0.0 - Simple Edition',
+        'version': '3.0.1 - Fixed Edition',
         'endpoints': {
             'health': 'GET /health',
             'verify_key': 'POST /verify-key',
@@ -147,6 +146,8 @@ def verify_key():
         personal_key = data['script_key']
         hwid = data.get('hwid')
         
+        print(f"🔐 Verifying key: {personal_key[:16]}... with HWID: {hwid[:16] if hwid else 'None'}...")
+        
         conn = get_db()
         cursor = conn.cursor()
         
@@ -159,22 +160,29 @@ def verify_key():
         
         if not user:
             conn.close()
+            print(f"❌ Invalid key: {personal_key[:16]}...")
             log_activity(hwid=hwid, action="INVALID_KEY", details=f"Key: {personal_key[:16]}...")
             return jsonify({'valid': False, 'error': 'Invalid personal key'}), 403
         
         discord_id, username, is_active, expiry_date, registered_hwid = user
         
+        print(f"✅ Found user: {username} (Discord ID: {discord_id})")
+        
         # Check if active
         if not is_active:
             conn.close()
+            print(f"❌ User {username} is inactive")
             log_activity(discord_id=discord_id, hwid=hwid, action="INACTIVE_USER", details="User is deactivated")
             return jsonify({'valid': False, 'error': 'Access revoked'}), 403
         
         # Check if expired
-        if expiry_date and datetime.fromisoformat(expiry_date) < datetime.now():
-            conn.close()
-            log_activity(discord_id=discord_id, hwid=hwid, action="EXPIRED_USER", details="Subscription expired")
-            return jsonify({'valid': False, 'error': 'Subscription expired'}), 403
+        if expiry_date:
+            expiry = datetime.fromisoformat(expiry_date)
+            if expiry < datetime.now():
+                conn.close()
+                print(f"❌ User {username} subscription expired on {expiry_date}")
+                log_activity(discord_id=discord_id, hwid=hwid, action="EXPIRED_USER", details="Subscription expired")
+                return jsonify({'valid': False, 'error': 'Subscription expired'}), 403
         
         # Check if HWID is blacklisted
         if hwid:
@@ -183,6 +191,7 @@ def verify_key():
             
             if blacklist_result:
                 conn.close()
+                print(f"🚫 HWID {hwid[:16]}... is blacklisted")
                 log_activity(discord_id=discord_id, hwid=hwid, action="BLACKLIST_ATTEMPT", details="HWID is blacklisted")
                 return jsonify({
                     'valid': False,
@@ -192,6 +201,7 @@ def verify_key():
             
             # Register or update HWID
             if not registered_hwid:
+                print(f"📝 Registering HWID for {username}: {hwid[:16]}...")
                 cursor.execute(
                     "UPDATE users SET hwid = ? WHERE discord_id = ?",
                     (hwid, discord_id)
@@ -200,9 +210,8 @@ def verify_key():
                 log_activity(discord_id=discord_id, hwid=hwid, action="HWID_REGISTERED", details="First time execution")
             elif registered_hwid != hwid:
                 # HWID changed - potential HWID reset or new device
+                print(f"⚠️ HWID changed for {username}: {registered_hwid[:16]}... -> {hwid[:16]}...")
                 log_activity(discord_id=discord_id, hwid=hwid, action="HWID_CHANGED", details=f"Old: {registered_hwid[:16]}...")
-                # You can choose to block this or allow it
-                # For now, we'll update it
                 cursor.execute(
                     "UPDATE users SET hwid = ? WHERE discord_id = ?",
                     (hwid, discord_id)
@@ -211,6 +220,7 @@ def verify_key():
         
         conn.close()
         
+        print(f"✅ Key verified successfully for {username}")
         log_activity(discord_id=discord_id, hwid=hwid, action="KEY_VERIFIED", details=f"User: {username}")
         
         return jsonify({
@@ -222,6 +232,8 @@ def verify_key():
         
     except Exception as e:
         print(f"❌ Error verifying key: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 @app.route('/v3/files/loaders/esp.lua', methods=['GET'])
@@ -373,34 +385,57 @@ def admin_whitelist_user():
     try:
         data = request.get_json()
         
+        print(f"📥 Received whitelist request: {data}")
+        
         if not data or 'discord_id' not in data or 'personal_key' not in data:
+            print("❌ Missing required fields")
             return jsonify({'error': 'discord_id and personal_key required'}), 400
         
         discord_id = data['discord_id']
         personal_key = data['personal_key']
         username = data.get('username', 'Unknown')
+        expiry_date = data.get('expiry_date')  # NEW: Accept expiry date
         
         conn = get_db()
         cursor = conn.cursor()
         
         try:
-            cursor.execute(
-                "INSERT INTO users (discord_id, username, personal_key, is_active) VALUES (?, ?, ?, 1)",
-                (discord_id, username, personal_key)
-            )
+            # Check if user already exists
+            cursor.execute("SELECT id FROM users WHERE discord_id = ?", (discord_id,))
+            existing = cursor.fetchone()
+            
+            if existing:
+                print(f"⚠️ User {username} already exists, updating...")
+                # Update existing user
+                cursor.execute(
+                    "UPDATE users SET personal_key = ?, username = ?, expiry_date = ?, is_active = 1 WHERE discord_id = ?",
+                    (personal_key, username, expiry_date, discord_id)
+                )
+            else:
+                print(f"➕ Adding new user {username}...")
+                # Insert new user
+                cursor.execute(
+                    "INSERT INTO users (discord_id, username, personal_key, expiry_date, is_active) VALUES (?, ?, ?, ?, 1)",
+                    (discord_id, username, personal_key, expiry_date)
+                )
+            
             conn.commit()
             
+            print(f"✅ Successfully whitelisted {username} with key {personal_key}")
             log_activity(discord_id=discord_id, action="USER_WHITELISTED", details=f"User: {username}")
             
-            return jsonify({'success': True})
+            return jsonify({'success': True, 'message': f'User {username} whitelisted successfully'})
             
-        except sqlite3.IntegrityError:
-            return jsonify({'error': 'User already exists'}), 409
+        except sqlite3.IntegrityError as e:
+            print(f"❌ Database integrity error: {e}")
+            return jsonify({'error': f'Database error: {str(e)}'}), 409
         finally:
             conn.close()
         
     except Exception as e:
         print(f"❌ Error whitelisting user: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 @app.route('/admin/remove-whitelist', methods=['POST'])
@@ -415,6 +450,8 @@ def admin_remove_whitelist():
         
         discord_id = data['discord_id']
         
+        print(f"🗑️ Removing whitelist for Discord ID: {discord_id}")
+        
         conn = get_db()
         cursor = conn.cursor()
         
@@ -422,6 +459,7 @@ def admin_remove_whitelist():
         conn.commit()
         conn.close()
         
+        print(f"✅ Successfully removed whitelist for {discord_id}")
         log_activity(discord_id=discord_id, action="USER_REMOVED", details="Removed from whitelist")
         
         return jsonify({'success': True})
@@ -445,6 +483,8 @@ def admin_blacklist():
         blacklisted_by = data.get('blacklisted_by', 'system')
         discord_id = data.get('discord_id')
         
+        print(f"🚫 Blacklisting HWID: {hwid[:16]}... - Reason: {reason}")
+        
         conn = get_db()
         cursor = conn.cursor()
         
@@ -460,11 +500,12 @@ def admin_blacklist():
             
             log_activity(discord_id=discord_id, hwid=hwid, action="HWID_BLACKLISTED", details=reason)
             
-            print(f"🚫 HWID blacklisted: {hwid[:16]}... - Reason: {reason}")
+            print(f"✅ Successfully blacklisted HWID: {hwid[:16]}...")
             
             return jsonify({'success': True})
             
         except sqlite3.IntegrityError:
+            print(f"⚠️ HWID {hwid[:16]}... already blacklisted")
             return jsonify({'error': 'HWID already blacklisted'}), 409
         finally:
             conn.close()
@@ -551,7 +592,7 @@ def internal_error(error):
 # =============================================
 if __name__ == '__main__':
     print("=" * 50)
-    print("Simple Bedwars ESP API v3.0")
+    print("Simple Bedwars ESP API v3.0.1")
     print("=" * 50)
     
     print_config()
