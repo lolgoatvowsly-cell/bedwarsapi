@@ -1,0 +1,21 @@
+# Render.com Deployment Configuration
+# This file tells Render how to deploy your API server
+
+services:
+  # API Server - Handles blacklist checks and tamper alerts
+  - type: web
+    name: bedwars-api
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements-api.txt
+    startCommand: python api_server.py
+    envVars:
+      - key: DISCORD_WEBHOOK_URL
+        sync: false
+      - key: PYTHON_VERSION
+        value: 3.11.0
+    disk:
+      name: auth-db
+      mountPath: /opt/render/project/src
+      sizeGB: 1
