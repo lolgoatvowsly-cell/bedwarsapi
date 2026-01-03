@@ -410,32 +410,24 @@ def get_esp_loader():
     Users execute: scriptkey = "KEY"; loadstring(game:HttpGet("THIS_URL"))()
     """
     try:
-        # Get script key from getgenv if available
-        script_key = request.args.get('key', '')
-        
-        # Load ESP template
-        esp_template = '''
--- Bedwars ESP Loader
+        esp_template = '''-- Bedwars ESP Loader
 -- API: ''' + request.host_url + '''
 
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local LocalPlayer = Players.LocalPlayer
 
--- Get script key from getgenv
-if not getgenv then
-    LocalPlayer:Kick("❌ Executor not supported!")
+-- Check if scriptkey variable exists in global scope
+if not scriptkey then
+    LocalPlayer:Kick("❌ Missing script key!\\n\\nUsage:\\nscriptkey = \\"YOUR_KEY\\";\\nloadstring(game:HttpGet(...))()")
     return
 end
 
-if not getgenv().scriptkey then
-    LocalPlayer:Kick("❌ Missing script key!\\n\\nUsage: scriptkey = \\"YOUR_KEY\\"; loadstring(game:HttpGet(...))()\\n")
-    return
-end
-
-local SCRIPT_KEY = getgenv().scriptkey
+local SCRIPT_KEY = scriptkey
 local API_URL = "''' + request.host_url.rstrip('/') + '''"
 local HWID = game:GetService("RbxAnalyticsService"):GetClientId()
+
+print("🔐 Verifying script key: " .. SCRIPT_KEY:sub(1, 8) .. "...")
 
 -- Verify key with API
 local function verifyKey()
@@ -452,8 +444,14 @@ local function verifyKey()
         return HttpService:JSONDecode(response.Body)
     end)
     
-    if not success or not result then
+    if not success then
+        warn("❌ API Error: " .. tostring(result))
         LocalPlayer:Kick("❌ Failed to connect to API!\\n\\n" .. tostring(result))
+        return false
+    end
+    
+    if not result then
+        LocalPlayer:Kick("❌ No response from API!")
         return false
     end
     
@@ -472,21 +470,22 @@ end
 
 -- Register HWID
 local function registerHWID()
-    pcall(function()
-        request({
-            Url = API_URL .. "/register-hwid",
-            Method = "POST",
-            Headers = {["Content-Type"] = "application/json"},
-            Body = HttpService:JSONEncode({
-                hwid = HWID,
-                script_key = SCRIPT_KEY
+    spawn(function()
+        pcall(function()
+            request({
+                Url = API_URL .. "/register-hwid",
+                Method = "POST",
+                Headers = {["Content-Type"] = "application/json"},
+                Body = HttpService:JSONEncode({
+                    hwid = HWID,
+                    script_key = SCRIPT_KEY
+                })
             })
-        })
+        end)
     end)
 end
 
 -- Verify and load
-print("🔐 Verifying script key...")
 local verified, data = verifyKey()
 
 if not verified then
@@ -494,12 +493,20 @@ if not verified then
 end
 
 print("✅ Key verified! Loading " .. data.script_name .. " v" .. data.version)
+print("📍 HWID: " .. HWID:sub(1, 16) .. "...")
 
 -- Register HWID in background
 registerHWID()
 
 -- Load the actual ESP script
-loadstring(game:HttpGet(API_URL .. "/v3/files/scripts/esp-main.lua"))()
+local success, err = pcall(function()
+    loadstring(game:HttpGet(API_URL .. "/v3/files/scripts/esp-main.lua"))()
+end)
+
+if not success then
+    warn("❌ ESP Load Error: " .. tostring(err))
+    LocalPlayer:Kick("❌ Failed to load ESP!\\n\\n" .. tostring(err))
+end
 '''
         
         return esp_template, 200, {'Content-Type': 'text/plain'}
