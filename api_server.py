@@ -241,7 +241,12 @@ def verify_key():
 def get_esp_loader():
     """Return the ESP loader script"""
     try:
-        esp_template = '''-- Bedwars ESP Loader - Simple Edition
+        # Get the base URL (ensure HTTPS for Render)
+        api_url = request.host_url.rstrip('/')
+        if 'render.com' in api_url:
+            api_url = api_url.replace('http://', 'https://')
+        
+        esp_template = '''-- Bedwars ESP Loader - Updated Edition
 -- Each user has their own personal key
 
 local HttpService = game:GetService("HttpService")
@@ -255,29 +260,39 @@ if not scriptkey then
 end
 
 local PERSONAL_KEY = scriptkey
-local API_URL = "''' + request.host_url.rstrip('/') + '''"
+local API_URL = "''' + api_url + '''"
 local HWID = game:GetService("RbxAnalyticsService"):GetClientId()
 
 print("🔐 Verifying your personal key...")
+print("📍 HWID: " .. HWID:sub(1, 16) .. "...")
 
 -- Verify key with API
 local function verifyKey()
     local success, result = pcall(function()
-        local response = request({
-            Url = API_URL .. "/verify-key",
-            Method = "POST",
-            Headers = {["Content-Type"] = "application/json"},
-            Body = HttpService:JSONEncode({
+        -- Use game:HttpPost for Roblox
+        local response = game:HttpPost(
+            API_URL .. "/verify-key",
+            HttpService:JSONEncode({
                 script_key = PERSONAL_KEY,
                 hwid = HWID
-            })
-        })
-        return HttpService:JSONDecode(response.Body)
+            }),
+            Enum.HttpContentType.ApplicationJson
+        )
+        return HttpService:JSONDecode(response)
     end)
     
     if not success then
-        warn("❌ API Error: " .. tostring(result))
-        LocalPlayer:Kick("❌ Failed to connect to API!\\n\\n" .. tostring(result))
+        local errorMsg = tostring(result)
+        warn("❌ API Error: " .. errorMsg)
+        
+        -- Better error messages
+        if errorMsg:find("403") or errorMsg:find("Forbidden") then
+            LocalPlayer:Kick("❌ INVALID KEY!\\n\\nYour key was rejected by the API.\\n\\nGet your key from Discord using /getscript")
+        elseif errorMsg:find("Http requests are not enabled") then
+            LocalPlayer:Kick("❌ HTTP REQUESTS NOT ENABLED!\\n\\nEnable HttpService in game settings.")
+        else
+            LocalPlayer:Kick("❌ Failed to connect to API!\\n\\n" .. errorMsg)
+        end
         return false
     end
     
